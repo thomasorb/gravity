@@ -521,7 +521,7 @@ class SpaceCraft(object):
 
         plt.figure()
         plt.plot(np.cumsum(self.all_t), np.sqrt(np.sum(np.array(self.all_v)**2, axis=1)))
-        plt.plot(np.cumsum(self.all_t), np.array(self.all_v))
+        #plt.plot(np.cumsum(self.all_t), np.array(self.all_v))
         #plt.yscale('log')
         plt.xlabel('t (s)')
         plt.ylabel('v (m/s)')
