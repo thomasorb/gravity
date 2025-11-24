@@ -221,7 +221,7 @@ class Atmosphere(object):
     def get_T(self, h):
         return self.get_parameter(h, 'T')
     def get_P(self, h):
-        return self.get_parameter(h, 'P')
+        return self.get_parameter(h, 'P')    
             
 
     def plot(self):
@@ -331,12 +331,15 @@ class SpaceCraft(object):
         self.gridsize_min = gridsize_min # minimum grid size in m
         self.max_dt = max_dt # max dt in s
         self.min_dt = min_dt # max dt in s
-
+        
         self.all_F = [F0, ]
         self.all_p = [p0, ]
         self.all_v = [v0, ]
         self.all_a = [a0, ]
         self.all_t = [0, ]
+        self.all_K = [np.nan,]
+        self.all_U = [np.nan,]
+        self.all_W = [np.nan,]
         self.t = 0
         self.all_parachute_tension = [self.parachute_tension, ]
         self.parachute_deployed = False
@@ -346,8 +349,9 @@ class SpaceCraft(object):
         self.all_microthrust = [self.microthrust, ]
         self.thruster_on = False
         self.all_thruster_on = [self.thruster_on, ]
+
         
-    def update(self, P, R, g, Fext=np.array([0.,0.]), dt=None):
+    def update(self, P, R, g, r, Fext=np.array([0.,0.]), dt=None):
 
         # compute a good dt given the minimum grid size and the maximum dt
         if dt is None:
@@ -390,16 +394,25 @@ class SpaceCraft(object):
         if len(self.engines) > 0:
             thrust = self.along_v(self.engines[0].thrust(dt, p0=P))
             self.F += thrust
-        
-        self.a = self.F / (self.get_mass())
-        self.v += self.a * dt
-        self.p += self.v * dt
 
+        
+        # Verlet integrator
+        new_a = self.F / self.get_mass()
+        a_mean = 0.5 * (self.a + new_a)
+        self.v += a_mean * dt
+        self.p += self.v * dt + 0.5 * a_mean * dt**2
+        self.a = new_a
+        
+        # save state
         self.all_p.append(np.array(self.p))
         self.all_v.append(np.array(self.v))
         self.all_a.append(np.array(self.a))
         self.all_t.append(float(dt))
 
+        # compute energy
+        self.all_K.append(0.5 * self.get_mass() * np.sqrt(np.sum(self.v**2))**2)
+        self.all_U.append(-np.sqrt(np.sum(g**2))*self.get_mass()*r)
+    
         if self.parachute_deployed:
             self.parachute_tension = self.get_mass() * (self.a + g)
         else:
@@ -517,6 +530,21 @@ class SpaceCraft(object):
             plt.grid()
 
 
+    def plot_energy(self):
+
+        plt.figure()
+        plt.plot(np.cumsum(self.all_t), np.array(self.all_U), label='U')
+        plt.plot(np.cumsum(self.all_t), np.array(self.all_K), label='K')
+        plt.plot(np.cumsum(self.all_t), np.array(self.all_K) + np.array(self.all_U), label='E')
+        
+        #plt.plot(np.cumsum(self.all_t), np.array(self.all_v))
+        #plt.yscale('log')
+        plt.xlabel('t (s)')
+        plt.ylabel('Energy (J)')
+        plt.title('Energy')
+        plt.legend()
+        plt.grid()
+    
     def plot_velocity(self):
 
         plt.figure()
