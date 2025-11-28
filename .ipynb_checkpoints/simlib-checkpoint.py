@@ -4,13 +4,22 @@ import matplotlib.patches
 
 import mars_atm_model
 
-
 g0 = 9.807 # m/s²
 
-def compute_mdot(thrust_vac, Ispvac):
-    # thrust_vac in N
-    # Ispvac in s
-    return thrust_vac / (Ispvac * g0) 
+
+class Action(object):
+
+    def __init__(self, f):
+        assert callable(f), 'f must be a function' 
+        self.f = f
+        self.done = False
+        
+    def __call__(self, *args, **kwargs):
+        if not self.done:
+            print('action', self.f)
+            self.f(*args, **kwargs)
+            self.done = True
+
 
 # https://en.wikipedia.org/wiki/Ariane_5
 # https://core.ac.uk/download/pdf/77231853.pdf
@@ -21,7 +30,8 @@ ariane_stage1_EAP_P241 = { # equipped with vulcain 2 engine
     'nozzle_exit_diameter':2.1,
     'Ispvac':432, 
     'dry_mass':14.7e3, 
-    'thrust_vac':1390e3
+    'thrust_vac':1390e3,
+    'max_mass':184700
     #'mdot'=323
 }
 
@@ -30,7 +40,19 @@ ariane_stage2_ESC_A = { #
     'nozzle_exit_diameter':0.99,
     'Ispvac':446, 
     'dry_mass':4.54e3, 
-    'thrust_vac':67e3
+    'thrust_vac':67e3,
+    'max_mass':19440
+    #'mdot'=323
+}
+
+
+ariane_stage2_ESC_A_second_burn = { # 
+    'diameter':0, # used to compute drag, but already considered in stage 1
+    'nozzle_exit_diameter':0.99,
+    'Ispvac':446, 
+    'dry_mass':0, 
+    'thrust_vac':67e3,
+    'max_mass':19440
     #'mdot'=323
 }
 
@@ -39,36 +61,41 @@ ariane_booster_EPC_H173 = {
     'nozzle_exit_diameter':3.06,
     'Ispvac':275, 
     'dry_mass':33e3,
-    'thrust_vac':7080e3
-}
-
-ariane_double_booster_EPC_H173 = {
-    'diameter':3.06, # used to compute drag
-    'nozzle_exit_diameter':3.06*2,
-    'Ispvac':275, 
-    'dry_mass':33e3*2,
-    'thrust_vac':7080e3*2
+    'thrust_vac':7080e3,
+    'max_mass':273000,
 }
 
 ariane_stage1 = ariane_stage1_EAP_P241
 ariane_stage2 = ariane_stage2_ESC_A
+ariane_stage2_second_burn = ariane_stage2_ESC_A_second_burn
 ariane_booster = ariane_booster_EPC_H173
-ariane_double_booster = ariane_double_booster_EPC_H173
 
 class Engine():
     
-    def __init__(self, propellant_mass, model=ariane_stage1, stage_number=1):
+    def __init__(self, propellant_mass=None, model=ariane_stage1, stage_number=1):
         
         # default from Vulcain 2: https://en.wikipedia.org/wiki/Vulcain_(rocket_engine) 
         # and https://arc.aiaa.org/doi/10.2514/1.A33363
+
+        def compute_mdot(thrust_vac, Ispvac):
+            # thrust_vac in N
+            # Ispvac in s
+            return thrust_vac / (Ispvac * g0) 
 
         self.stage_number = stage_number
         self.started = False
         self.Ae = model['nozzle_exit_diameter']**2 * np.pi / 4
         self.Ispvac = model['Ispvac'] # s
+        self.thrust_vac = model['thrust_vac']
         self.mdot = compute_mdot(model['thrust_vac'], model['Ispvac']) # kg/s
-        self.propellant_mass = propellant_mass
         self.dry_mass = model['dry_mass']
+        self.max_mass = model['max_mass']
+        if propellant_mass is None:
+            propellant_mass = self.max_mass - self.dry_mass
+        if propellant_mass + self.dry_mass> self.max_mass:
+            print(f'WARNING: too much propellant, max propellant mass: {self.max_mass - self.dry_mass}')
+        self.propellant_mass = propellant_mass
+        self.exhaust_velocity = g0 * self.Ispvac
     
     def is_started(self): 
         return bool(self.started)
@@ -93,9 +120,12 @@ class Engine():
         self.propellant_mass -= needed_mass * ratio
         
         # https://en.wikipedia.org/wiki/Rocket_engine_nozzle
-        F = self.Ispvac * g0 * self.mdot - self.Ae * p0 # F in N
+        F = self.get_F(p0=p0)
         
         return F * ratio
+
+    def get_F(self, p0=101325):
+        return self.thrust_vac - self.Ae * p0 # F in N
     
     def get_mass(self):
         return self.dry_mass + self.propellant_mass
@@ -103,6 +133,21 @@ class Engine():
     def is_empty(self):
         if self.propellant_mass > 0: return False
         return True
+
+    def compute_deltaV(self, propellant_mass=None, dry_mass=None):
+        if propellant_mass is None:
+            propellant_mass = self.propellant_mass
+        if dry_mass is None:
+            dry_mass = self.dry_mass
+        mi = dry_mass + propellant_mass
+        deltaV = self.exhaust_velocity * np.log(mi/dry_mass)
+        return deltaV
+
+    def compute_propellant_mass(self, deltaV, dry_mass=None):
+        if dry_mass is None:
+            dry_mass = self.dry_mass
+        
+        return dry_mass * (np.exp(deltaV/self.exhaust_velocity) - 1)
 
 
 class AtmosphericLayer(object):
@@ -308,6 +353,18 @@ class Planet(object):
 
         return np.sqrt(self.G * self.mass / (h + self.radius))
 
+    def get_transfer_orbit_velocity(self, h, h1, h2):
+        r1 = self.radius + h1
+        r2 = self.radius + h2
+        r = self.radius + h
+        return (2*self.G*self.mass*((1/r)-(1/(r1+r2))))**0.5
+
+    def get_Hohmann_transfer_deltaV(self, h1, h2):
+        deltaV1 = self.get_transfer_orbit_velocity(h1, h1, h2) - self.get_circular_orbit_velocity(h1) 
+        deltaV2 = -(self.get_transfer_orbit_velocity(h2, h1, h2) - self.get_circular_orbit_velocity(h2)) 
+        print(f'deltaV1: {deltaV1} m/s\ndeltaV2: {deltaV2} m/s')
+        return deltaV1, deltaV2
+
 class SpaceCraft(object):
 
     def __init__(self, mass, p0, v0, a0, area, F0=(0,0), gridsize_min=3, min_dt=0.1, max_dt=1000, engines=None):
@@ -340,6 +397,8 @@ class SpaceCraft(object):
         self.all_K = [np.nan,]
         self.all_U = [np.nan,]
         self.all_W = [np.nan,]
+        self.all_mass = [float(self.get_mass()), ]
+        
         self.t = 0
         self.all_parachute_tension = [self.parachute_tension, ]
         self.parachute_deployed = False
@@ -350,6 +409,11 @@ class SpaceCraft(object):
         self.thruster_on = False
         self.all_thruster_on = [self.thruster_on, ]
 
+        self.all_actions = list()
+        #self.add_action('init')
+
+    def add_action(self, name):
+        self.all_actions.append((name, np.copy(self.p), np.copy(self.t)))        
         
     def update(self, P, R, g, r, Fext=np.array([0.,0.]), dt=None):
 
@@ -383,17 +447,18 @@ class SpaceCraft(object):
         self.F += (self.get_mass()) * g
         self.F += self.microthrust
 
-        # detach empty engines
-        for i in range(len(self.engines)):
-            if self.engines[i].is_empty():
+        # detach only next empty engine (if higher stages are empty while lower stages are still full, engines are not detached)
+        if len(self.engines) > 0:
+            if self.engines[0].is_empty() and self.engines[0].is_started():
                 print(f'engine {self.engines[0].stage_number} detached')
-                del self.engines[i]
-                break
+                del self.engines[0]
+                self.add_action('engine detached')    
 
         # add engine force
         if len(self.engines) > 0:
-            thrust = self.along_v(self.engines[0].thrust(dt, p0=P))
-            self.F += thrust
+            for iengine in self.engines:
+                thrust = self.along_v(iengine.thrust(dt, p0=P))
+                self.F += thrust
 
         
         # Verlet integrator
@@ -422,6 +487,7 @@ class SpaceCraft(object):
             
         self.all_microthruster_on.append(bool(self.microthruster_on))
         self.all_microthrust.append(float(self.max_microthrust))
+        self.all_mass.append(float(self.get_mass()))
         self.t += dt
         return dt
 
@@ -431,7 +497,15 @@ class SpaceCraft(object):
             mass += iengine.get_mass()
         
         return mass
-    
+
+    def rotate(self, angle):
+        theta = np.deg2rad(angle)
+        R = np.array([[np.cos(theta), -np.sin(theta)],
+                      [np.sin(theta), np.cos(theta)]])
+
+        self.v = np.dot(R, self.v)
+        self.add_action(f'rotation by {angle} degrees')
+        
     def deploy_parachute(self, area):
         self.area = float(area)
         self.parachute_deployed = True
@@ -451,10 +525,15 @@ class SpaceCraft(object):
 
     def start_thruster(self):
         if len(self.engines) > 0:
-            if not self.engines[0].is_started():
-                self.engines[0].start()
-                print(f'engine {self.engines[0].stage_number} started')
-        
+            for iengine in self.engines:
+                if not iengine.is_started():
+                    iengine.start()
+                    self.add_action('engine started')
+                    print(f'engine {iengine.stage_number} started: {iengine.propellant_mass/1e3} T')
+                    return
+            raise Exception('All engines started')        
+        else:
+            raise Exception('No engine attached')
 
     def stop_thruster(self):
         if len(self.engines) == 0:
@@ -496,8 +575,14 @@ class SpaceCraft(object):
             plt.plot(*target_xy, c='red')
 
         if altitude_target is not None:
-            cc = matplotlib.patches.Circle((0., 0.), planet.radius + altitude_target, color='red', fill=False, alpha=0.5)
-            fig.gca().add_patch(cc)
+            try:
+                iter(altitude_target)
+            except TypeError:
+                altitude_target = [altitude_target,]
+
+            for ialt in altitude_target:
+                cc = matplotlib.patches.Circle((0., 0.), planet.radius + ialt, color='red', fill=False, alpha=0.5)
+                fig.gca().add_patch(cc)
                 
         
         xlim = np.min(xy[:,0]), np.max(xy[:,0])
@@ -520,7 +605,11 @@ class SpaceCraft(object):
 
         plt.xlim(xlim[0] - dx, xlim[1] + dx)
         plt.ylim(ylim[0] - dy, ylim[1] + dy)
-            
+
+        for iaction in self.all_actions:
+            plt.scatter(iaction[1][0], iaction[1][1], c='tab:green', marker='s')
+            plt.text(iaction[1][0] - dx*0.1, iaction[1][1]+dy*0.1, '{} {:.0f}s'.format(iaction[0], iaction[2]), ha='right', color='tab:green')
+        
         if not overplot:
             plt.xlabel('x (m)')
             plt.ylabel('y (m)')
@@ -566,6 +655,16 @@ class SpaceCraft(object):
         plt.title('Probe Acceleration')
         plt.grid()
 
+    def plot_mass(self):
+
+        plt.figure()
+        plt.plot(np.cumsum(self.all_t), self.all_mass)
+        #plt.yscale('log')
+        plt.xlabel('t (s)')
+        plt.ylabel(r'mass (kg)')
+        plt.title('Probe Mass')
+        plt.grid()
+
     def plot_parachute_tension(self, max_tension=5e3):
         plt.figure()
         #plt.plot(np.cumsum(self.all_t), self.all_parachute_tension)
@@ -584,3 +683,6 @@ mars_atm = Atmosphere()
 #mars_atm.add_layer(AtmosphericLayer([7000, 20000], [-23.4, - 0.00222 ], [.699, -0.00009], [.1921]))
 mars_atm.add_layer(AtmosphericLayer([1, 120000], mars_atm_model.ftemp, mars_atm_model.fpres, mars_atm_model.fdens, model='function'))
 Mars = Planet(6.417e23, 3389.5e3, mars_atm)
+
+
+Earth = Planet(5.97e24, 6371e3, mars_atm)
